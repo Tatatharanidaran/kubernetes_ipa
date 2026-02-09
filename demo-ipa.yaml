@@ -1,0 +1,20 @@
+apiVersion: autoscaling.example.com/v1
+kind: IntelligentPodAutoscaler
+metadata:
+  name: demo-ipa
+  namespace: default
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: js-app
+
+  metric: sum(rate(http_requests_total{route="/"}[1m]))
+  targetPerPod: 50
+
+  minReplicas: 1
+  maxReplicas: 20
+
+  lookbackSeconds: 600
+  horizonSeconds: 300
+  cooldownSeconds: 60

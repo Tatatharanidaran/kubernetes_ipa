@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-decision-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-decision-service
+  template:
+    metadata:
+      labels:
+        app: llm-decision-service
+    spec:
+      containers:
+        - name: llm-decision-service
+          image: llm-decision-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+          env:
+            - name: OLLAMA_BASE_URL
+              value: "http://ollama:11434"
+            - name: OLLAMA_MODEL
+              value: "llama3.2:1b"
+            - name: OLLAMA_TIMEOUT_SECONDS
+              value: "10"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-decision-service
+spec:
+  selector:
+    app: llm-decision-service
+  ports:
+    - port: 5000
+      targetPort: 5000

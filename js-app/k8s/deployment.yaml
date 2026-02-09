@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: js-app
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: js-app
+  template:
+    metadata:
+      labels:
+        app: js-app
+    spec:
+      containers:
+        - name: js-app
+          image: js-app:latest
+          imagePullPolicy: Never
+          ports:
+            - name: metrics
+              containerPort: 8080

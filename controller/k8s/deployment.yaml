@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ipa-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ipa-controller
+  template:
+    metadata:
+      labels:
+        app: ipa-controller
+    spec:
+      serviceAccountName: ipa-controller
+      containers:
+      - name: controller
+        image: ipa-controller:local
+        imagePullPolicy: Never

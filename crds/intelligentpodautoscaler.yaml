@@ -1,0 +1,182 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: intelligentpodautoscalers.autoscaling.example.com
+spec:
+  group: autoscaling.example.com
+  scope: Namespaced
+  names:
+    plural: intelligentpodautoscalers
+    singular: intelligentpodautoscaler
+    kind: IntelligentPodAutoscaler
+    shortNames:
+      - ipa
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - targetRef
+                - targetPerPod
+              properties:
+
+                targetRef:
+                  type: object
+                  required:
+                    - apiVersion
+                    - kind
+                    - name
+                  properties:
+                    apiVersion:
+                      type: string
+                      description: API version of the target resource (e.g. apps/v1)
+                    kind:
+                      type: string
+                      enum:
+                        - Deployment
+                      description: Only Deployment is supported
+                    name:
+                      type: string
+                      description: Name of the target Deployment
+
+                metric:
+                  type: string
+                  description: |
+                    PromQL expression returning a SINGLE aggregated time series.
+                    Example:
+                      sum(rate(http_requests_total{route="/"}[1m]))
+                  default: sum(rate(http_requests_total{route="/"}[1m]))
+
+                targetPerPod:
+                  type: integer
+                  minimum: 1
+                  description: Desired load per pod (requests/sec)
+
+                lookbackSeconds:
+                  type: integer
+                  minimum: 60
+                  default: 1800
+                  description: Historical window used for prediction (seconds)
+
+                horizonSeconds:
+                  type: integer
+                  minimum: 30
+                  default: 300
+                  description: How far into the future to predict (seconds)
+
+                minReplicas:
+                  type: integer
+                  minimum: 1
+                  default: 1
+                  description: Minimum number of replicas
+
+                maxReplicas:
+                  type: integer
+                  minimum: 1
+                  default: 20
+                  description: Maximum number of replicas
+
+                cooldownSeconds:
+                  type: integer
+                  minimum: 0
+                  default: 120
+                  description: Cooldown period between scaling actions (seconds)
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: intelligentpodautoscalers.autoscaling.example.com
+spec:
+  group: autoscaling.example.com
+  scope: Namespaced
+  names:
+    plural: intelligentpodautoscalers
+    singular: intelligentpodautoscaler
+    kind: IntelligentPodAutoscaler
+    shortNames:
+      - ipa
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - targetRef
+                - targetPerPod
+              properties:
+
+                targetRef:
+                  type: object
+                  required:
+                    - apiVersion
+                    - kind
+                    - name
+                  properties:
+                    apiVersion:
+                      type: string
+                      description: API version of the target resource (e.g. apps/v1)
+                    kind:
+                      type: string
+                      enum:
+                        - Deployment
+                      description: Only Deployment is supported
+                    name:
+                      type: string
+                      description: Name of the target Deployment
+
+                metric:
+                  type: string
+                  description: |
+                    PromQL expression returning a SINGLE aggregated time series.
+                    Example:
+                      sum(rate(http_requests_total{route="/"}[1m]))
+                  default: sum(rate(http_requests_total{route="/"}[1m]))
+
+                targetPerPod:
+                  type: integer
+                  minimum: 1
+                  description: Desired load per pod (requests/sec)
+
+                lookbackSeconds:
+                  type: integer
+                  minimum: 60
+                  default: 1800
+                  description: Historical window used for prediction (seconds)
+
+                horizonSeconds:
+                  type: integer
+                  minimum: 30
+                  default: 300
+                  description: How far into the future to predict (seconds)
+
+                minReplicas:
+                  type: integer
+                  minimum: 1
+                  default: 1
+                  description: Minimum number of replicas
+
+                maxReplicas:
+                  type: integer
+                  minimum: 1
+                  default: 20
+                  description: Maximum number of replicas
+
+                cooldownSeconds:
+                  type: integer
+                  minimum: 0
+                  default: 120
+                  description: Cooldown period between scaling actions (seconds)

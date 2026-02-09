@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: predictor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: predictor
+  template:
+    metadata:
+      labels:
+        app: predictor
+    spec:
+      containers:
+      - name: predictor
+        image: predictor:local
+        imagePullPolicy: Never
+        env:
+        - name: PROM_URL
+          value: http://prometheus-k8s.monitoring.svc.cluster.local:9090
+        ports:
+        - containerPort: 8000
