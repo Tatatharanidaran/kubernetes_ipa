@@ -1,0 +1,23 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ipa-backend-events
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["pods", "events", "services"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ipa-backend-events
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ipa-backend-events
+subjects:
+- kind: ServiceAccount
+  name: ipa-backend
+  namespace: default

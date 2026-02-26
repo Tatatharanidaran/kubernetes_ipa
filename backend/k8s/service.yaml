@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ipa-backend
+  namespace: default
+  labels:
+    app: ipa-backend
+spec:
+  selector:
+    app: ipa-backend
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000

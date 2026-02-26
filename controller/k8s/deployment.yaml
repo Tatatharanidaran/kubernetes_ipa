@@ -3,6 +3,7 @@ kind: Deployment
 metadata:
   name: ipa-controller
 spec:
+  # Single replica required to avoid concurrent scaling conflicts
   replicas: 1
   selector:
     matchLabels:

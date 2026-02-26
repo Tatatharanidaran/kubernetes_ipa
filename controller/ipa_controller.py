@@ -23,6 +23,9 @@ LAST_SCALE_DOWN = {}
     interval=POLL_INTERVAL,
 )
 def reconcile(spec, namespace, logger, **_):
+    if not hasattr(reconcile, "_last_state"):
+        reconcile._last_state = {}
+
     target = spec["targetRef"]["name"]
 
     dep = apps_api.read_namespaced_deployment(target, namespace)
@@ -52,15 +55,30 @@ def reconcile(spec, namespace, logger, **_):
         logger.error(f"[{target}] Predictor failed: {e}")
         return
 
-    # ------------------ Math decision (TRUTH) ------------------
-    desired = math.ceil(prediction / target_per_pod)
-    desired = max(min_r, min(max_r, desired))
+    # --- SMART AUTOSCALER FIX START ---
+    # ------------------ Threshold + hysteresis decision ------------------
+    scale_step = max(1, int(spec.get("scaleStep", 1)))
+    hysteresis_buffer = max(0.0, float(spec.get("hysteresisBuffer", 5)))
+
+    high_threshold = float(current * target_per_pod)
+    low_threshold = float(max(0, current - scale_step) * target_per_pod)
+    upper_scale_threshold = high_threshold + hysteresis_buffer
+    lower_scale_threshold = max(0.0, low_threshold - hysteresis_buffer)
 
     action = "stable"
-    if desired > current:
+    desired = current
+
+    if prediction > upper_scale_threshold:
         action = "scale_up"
-    elif desired < current:
+        desired = min(current + scale_step, max_r)
+    elif prediction < lower_scale_threshold:
         action = "scale_down"
+        desired = max(current - scale_step, min_r)
+
+    # If already at limits, avoid misleading scale action.
+    if desired == current:
+        action = "stable"
+    # --- SMART AUTOSCALER FIX END ---
 
     # ------------------ Cooldown (scale-down only) ------------------
     last_down = LAST_SCALE_DOWN.get(target)
@@ -69,9 +87,30 @@ def reconcile(spec, namespace, logger, **_):
             desired = current
             action = "stable"
 
-    # ------------------ Ask LLM for explanation ONLY ------------------
-    reason = f"Math-based decision: {prediction:.2f} rps / {target_per_pod} per pod"
+    # --- SMART AUTOSCALER FIX START ---
+    if action == "scale_up":
+        reason = (
+            f"Scaling up: prediction {prediction:.2f} > upper threshold "
+            f"{upper_scale_threshold:.2f}."
+        )
+    elif action == "scale_down":
+        reason = (
+            f"Scaling down: prediction {prediction:.2f} < lower threshold "
+            f"{lower_scale_threshold:.2f}."
+        )
+    else:
+        reason = (
+            f"Stable: prediction {prediction:.2f} within hysteresis band "
+            f"[{lower_scale_threshold:.2f}, {upper_scale_threshold:.2f}] "
+            f"or bounded by replica limits."
+        )
 
+    logger.info(
+        f"[DEBUG] prediction={prediction:.2f} current={current} desired={desired} decision={action}"
+    )
+    # --- SMART AUTOSCALER FIX END ---
+
+    # ------------------ Ask LLM for explanation ONLY ------------------
     try:
         llm_resp = requests.post(
             LLM_URL,
@@ -84,25 +123,60 @@ def reconcile(spec, namespace, logger, **_):
             timeout=LLM_TIMEOUT,
         )
         llm_resp.raise_for_status()
-        reason = llm_resp.json()["reason"]
+        llm_reason = llm_resp.json().get("reason")
+        if llm_reason:
+            reason = f"{reason} | LLM note: {llm_reason}"
     except Exception as e:
         logger.warning(f"[{target}] LLM unavailable: {e}")
         # LLM is optional, NEVER critical
 
-    # ------------------ Log ------------------
-    logger.info(
-        f"[{target}] action={action} "
-        f"prediction={prediction:.2f} "
-        f"current={current} desired={desired} "
-        f"reason={reason}"
-    )
+    # ------------------ Log (reduce stable-no-change noise) ------------------
+    last_state = reconcile._last_state.get(target, {"action": None, "replicas": None})
+    should_log = True
+
+    if action == "stable" and desired == current:
+        if last_state["action"] == action and last_state["replicas"] == desired:
+            should_log = False
+
+    # Always log critical scaling decisions with full reasoning.
+    if action in ("scale_up", "scale_down"):
+        should_log = True
+
+    if should_log:
+        logger.info(
+            f"[{target}] action={action} "
+            f"prediction={prediction:.2f} "
+            f"current={current} desired={desired} "
+            f"reason={reason}"
+        )
 
     # ------------------ Apply scaling ------------------
     if desired != current:
         dep.spec.replicas = desired
-        apps_api.patch_namespaced_deployment(target, namespace, dep)
+        patched = False
+
+        for attempt in range(3):
+            try:
+                apps_api.patch_namespaced_deployment(target, namespace, dep)
+                patched = True
+                break
+            except client.rest.ApiException as e:
+                if e.status == 409:
+                    logger.warning(
+                        f"[{target}] Deployment modified concurrently, retrying with latest version..."
+                    )
+                    dep = apps_api.read_namespaced_deployment(target, namespace)
+                    dep.spec.replicas = desired
+                    continue
+                raise
+
+        if not patched:
+            logger.error(f"[{target}] Failed to patch deployment after retries.")
+            return
 
         if desired < current:
             LAST_SCALE_DOWN[target] = now
 
         logger.info(f"[{target}] Scaled {current} → {desired}")
+
+    reconcile._last_state[target] = {"action": action, "replicas": desired}

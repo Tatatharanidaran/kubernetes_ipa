@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen-auto
+  labels:
+    app: loadgen-auto
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loadgen-auto
+  template:
+    metadata:
+      labels:
+        app: loadgen-auto
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: loadgen-auto
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          command:
+            - sh
+            - -c
+            - |
+              target_url="http://js-app.default.svc.cluster.local:8080"
+              rps=10
+              max_rps=200
+              while true; do
+                i=0
+                while [ "$i" -lt "$rps" ]; do
+                  wget -qO- "$target_url" >/dev/null 2>&1 &
+                  i=$((i + 1))
+                done
+                wait
+                if [ "$rps" -lt "$max_rps" ]; then
+                  rps=$((rps + 10))
+                fi
+                sleep 1
+              done
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - wget -qO- http://js-app.default.svc.cluster.local:8080 >/dev/null 2>&1
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6

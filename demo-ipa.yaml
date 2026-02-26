@@ -10,7 +10,7 @@ spec:
     name: js-app
 
   metric: sum(rate(http_requests_total{route="/"}[1m]))
-  targetPerPod: 50
+  targetPerPod: 20
 
   minReplicas: 1
   maxReplicas: 20

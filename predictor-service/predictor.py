@@ -16,6 +16,13 @@ PROM_URL = os.environ.get(
 PREDICTION_SUCCESS_THRESHOLD_PCT = float(
     os.environ.get("PREDICTION_SUCCESS_THRESHOLD_PCT", "0.2")
 )
+PROM_QUERY_RETRIES = int(os.environ.get("PROM_QUERY_RETRIES", "3"))
+PROM_QUERY_BACKOFF_SECONDS = float(os.environ.get("PROM_QUERY_BACKOFF_SECONDS", "0.5"))
+FALLBACK_FAILURE_THRESHOLD = int(os.environ.get("FALLBACK_FAILURE_THRESHOLD", "3"))
+DEFAULT_METRIC_LABEL = os.environ.get(
+    "DEFAULT_METRIC_LABEL",
+    'sum(rate(http_requests_total{route="/"}[1m]))',
+)
 
 app = Flask(__name__)
 prom = PrometheusConnect(url=PROM_URL, disable_ssl=True)
@@ -68,6 +75,8 @@ PREDICTION_ACCURACY_SUCCESS = Gauge(
 )
 
 PENDING_PREDICTIONS = []
+CONSECUTIVE_FAILURES = {}
+LAST_GOOD_PREDICTIONS = {}
 
 
 def _record_metrics(metric, prediction, low, high, fallback):
@@ -77,6 +86,51 @@ def _record_metrics(metric, prediction, low, high, fallback):
     PREDICTION_FALLBACK.labels(metric=metric).set(1 if fallback else 0)
     if not fallback:
         PREDICTION_LAST_PREDICTION.labels(metric=metric).set(time.time())
+
+
+def _mark_success(metric, prediction, low, high, model):
+    CONSECUTIVE_FAILURES[metric] = 0
+    LAST_GOOD_PREDICTIONS[metric] = {
+        "prediction": float(prediction),
+        "low": float(low),
+        "high": float(high),
+        "model": model,
+        "updated_at": time.time(),
+    }
+
+
+def _init_metrics():
+    # Ensure timeseries exist on startup so Prometheus queries don't return empty vectors
+    # before the first /predict request is served   .
+    _record_metrics(DEFAULT_METRIC_LABEL, 0.0, 0.0, 0.0, fallback=True)
+    PREDICTION_ACCURACY_SUCCESS.labels(metric=DEFAULT_METRIC_LABEL).set(0)
+    PREDICTION_ACCURACY_ERROR.labels(metric=DEFAULT_METRIC_LABEL).set(0.0)
+    PREDICTION_LAST_SUCCESS.labels(metric=DEFAULT_METRIC_LABEL).set(0)
+    PREDICTION_LAST_FAILURE.labels(metric=DEFAULT_METRIC_LABEL).set(0)
+
+
+def _query_range_with_retries(metric, start_time, end_time, step):
+    last_error = None
+    for attempt in range(1, PROM_QUERY_RETRIES + 1):
+        try:
+            return prom.custom_query_range(
+                query=metric,
+                start_time=start_time,
+                end_time=end_time,
+                step=step,
+            )
+        except Exception as exc:
+            last_error = exc
+            app.logger.warning(
+                "Prometheus query attempt %s/%s failed for metric='%s': %s",
+                attempt,
+                PROM_QUERY_RETRIES,
+                metric,
+                exc,
+            )
+            if attempt < PROM_QUERY_RETRIES:
+                time.sleep(PROM_QUERY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+    raise last_error if last_error is not None else RuntimeError("unknown_prometheus_query_failure")
 
 
 def _enqueue_prediction(metric, prediction, horizon):
@@ -111,7 +165,8 @@ def _query_actual(metric, ts):
         if not np.isfinite(actual):
             return None
         return actual
-    except Exception:
+    except Exception as e:
+        app.logger.warning("Failed actual-value query for metric='%s' at ts=%s: %s", metric, ts, e)
         return None
 
 
@@ -149,6 +204,12 @@ def _evaluate_pending():
 
 
 def _safe_fallback(metric, horizon, reason):
+    app.logger.warning(
+        "Fallback prediction used for metric='%s' horizon=%ss reason=%s",
+        metric,
+        horizon,
+        reason,
+    )
     _record_metrics(metric, 0.0, 0.0, 0.0, fallback=True)
     return jsonify({
         "metric": metric,
@@ -162,6 +223,90 @@ def _safe_fallback(metric, horizon, reason):
     }), 200
 
 
+def _graceful_failure(metric, horizon, reason):
+    streak = CONSECUTIVE_FAILURES.get(metric, 0) + 1
+    CONSECUTIVE_FAILURES[metric] = streak
+
+    if streak < FALLBACK_FAILURE_THRESHOLD:
+        cached = LAST_GOOD_PREDICTIONS.get(metric)
+        if cached:
+            app.logger.warning(
+                "Prometheus data unavailable for metric='%s' (failure streak %s/%s). "
+                "Serving cached prediction.",
+                metric,
+                streak,
+                FALLBACK_FAILURE_THRESHOLD,
+            )
+            _record_metrics(
+                metric,
+                cached["prediction"],
+                cached["low"],
+                cached["high"],
+                fallback=False,
+            )
+            return jsonify({
+                "metric": metric,
+                "prediction": cached["prediction"],
+                "low": cached["low"],
+                "high": cached["high"],
+                "horizon_seconds": horizon,
+                "model": f"cached:{cached.get('model', 'unknown')}",
+                "fallback": False,
+                "reason": f"{reason}:transient_failure_{streak}",
+            }), 200
+
+        app.logger.warning(
+            "Prometheus data unavailable for metric='%s' (failure streak %s/%s). "
+            "No cached prediction available yet.",
+            metric,
+            streak,
+            FALLBACK_FAILURE_THRESHOLD,
+        )
+        _record_metrics(metric, 0.0, 0.0, 0.0, fallback=False)
+        return jsonify({
+            "metric": metric,
+            "prediction": 0.0,
+            "low": 0.0,
+            "high": 0.0,
+            "horizon_seconds": horizon,
+            "model": "grace",
+            "fallback": False,
+            "reason": f"{reason}:transient_failure_{streak}",
+        }), 200
+
+    return _safe_fallback(
+        metric,
+        horizon,
+        f"{reason}:failure_streak_{streak}",
+    )
+
+
+def _baseline_prediction(metric, horizon, value, reason):
+    yhat = max(0.0, float(value))
+    low = max(0.0, yhat * 0.9)
+    high = yhat * 1.1
+    app.logger.info(
+        "Baseline prediction used for metric='%s' horizon=%ss reason=%s value=%.4f",
+        metric,
+        horizon,
+        reason,
+        yhat,
+    )
+    _record_metrics(metric, yhat, low, high, fallback=False)
+    _mark_success(metric, yhat, low, high, "baseline")
+    _enqueue_prediction(metric, yhat, horizon)
+    return jsonify({
+        "metric": metric,
+        "prediction": yhat,
+        "low": low,
+        "high": high,
+        "horizon_seconds": horizon,
+        "model": "baseline",
+        "fallback": False,
+        "reason": reason
+    }), 200
+
+
 @app.route("/health")
 def health():
     return "ok", 200
@@ -170,6 +315,11 @@ def health():
 @app.route("/metrics")
 def metrics():
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+
+_init_metrics()
+app.logger.info("Predictor Prometheus source URL: %s", PROM_URL)
+print("Prometheus metrics endpoint ready at /metrics", flush=True)
 
 
 @app.route("/predict", methods=["GET"])
@@ -185,20 +335,24 @@ def predict():
         end_time = datetime.utcnow()
         start_time = end_time - timedelta(seconds=lookback)
 
-        result = prom.custom_query_range(
-            query=metric,
+        result = _query_range_with_retries(
+            metric=metric,
             start_time=start_time,
             end_time=end_time,
-            step="30s"
+            step="30s",
         )
 
         # ---------- HARD GUARDS ----------
         if not result:
-            return _safe_fallback(metric, horizon, "empty_result")
+            return _graceful_failure(metric, horizon, "empty_result")
 
         values = result[0].get("values", [])
         if len(values) < 5:
-            return _safe_fallback(metric, horizon, "insufficient_points")
+            if values:
+                latest = pd.to_numeric(values[-1][1], errors="coerce")
+                if pd.notna(latest):
+                    return _baseline_prediction(metric, horizon, float(latest), "insufficient_points")
+            return _graceful_failure(metric, horizon, "insufficient_points")
 
         df = pd.DataFrame(values, columns=["ds", "y"])
         df["ds"] = pd.to_datetime(df["ds"], unit="s")
@@ -207,10 +361,10 @@ def predict():
         df.dropna(inplace=True)
 
         if df.empty:
-            return _safe_fallback(metric, horizon, "nan_series")
+            return _graceful_failure(metric, horizon, "nan_series")
 
         if np.isclose(df["y"].std(), 0.0):
-            return _safe_fallback(metric, horizon, "no_variance")
+            return _baseline_prediction(metric, horizon, float(df["y"].iloc[-1]), "no_variance")
 
         # ---------- PROPHET ----------
         model = Prophet(
@@ -229,11 +383,12 @@ def predict():
 
         yhat = float(pred["yhat"])
         if not np.isfinite(yhat):
-            return _safe_fallback(metric, horizon, "invalid_prediction")
+            return _graceful_failure(metric, horizon, "invalid_prediction")
 
         low = float(pred["yhat_lower"])
         high = float(pred["yhat_upper"])
         _record_metrics(metric, yhat, low, high, fallback=False)
+        _mark_success(metric, yhat, low, high, "prophet")
         _enqueue_prediction(metric, yhat, horizon)
 
         return jsonify({
@@ -247,4 +402,4 @@ def predict():
         }), 200
 
     except Exception as e:
-        return _safe_fallback(metric, horizon, f"exception:{str(e)}")
+        return _graceful_failure(metric, horizon, f"exception:{str(e)}")
