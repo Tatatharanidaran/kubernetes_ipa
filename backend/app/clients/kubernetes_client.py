@@ -4,6 +4,7 @@ from typing import Optional
 
 from fastapi.concurrency import run_in_threadpool
 from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
 
 logger = logging.getLogger(__name__)
 
@@ -69,3 +70,38 @@ class KubernetesClient:
             field_selector=field_selector,
         )
         return event_list.items
+
+    async def get_deployment(self, namespace: str, name: str) -> client.V1Deployment | None:
+        await self._ensure_initialized()
+        try:
+            return await run_in_threadpool(
+                self._apps_v1.read_namespaced_deployment,
+                name,
+                namespace,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise
+
+    async def create_deployment(
+        self,
+        namespace: str,
+        body: client.V1Deployment,
+    ) -> client.V1Deployment:
+        await self._ensure_initialized()
+        return await run_in_threadpool(
+            self._apps_v1.create_namespaced_deployment,
+            namespace,
+            body,
+        )
+
+    async def scale_deployment(self, namespace: str, name: str, replicas: int) -> None:
+        await self._ensure_initialized()
+        scale_body = {"spec": {"replicas": replicas}}
+        await run_in_threadpool(
+            self._apps_v1.patch_namespaced_deployment_scale,
+            name,
+            namespace,
+            scale_body,
+        )

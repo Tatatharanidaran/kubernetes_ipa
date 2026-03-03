@@ -1,5 +1,11 @@
 import { useEffect, useState } from 'react'
-import { getPredictions, getScalingEvents } from '../api/client'
+import {
+  getAutoLoadStatus,
+  getPredictions,
+  getScalingEvents,
+  startAutoLoad,
+  stopAutoLoad,
+} from '../api/client'
 import MetricCard from '../components/MetricCard'
 import PredictionTrend from '../components/PredictionTrend'
 import ScalingTimeline from '../components/ScalingTimeline'
@@ -9,6 +15,8 @@ function Dashboard() {
   const [predictionHistory, setPredictionHistory] = useState([])
   const [actualHistory, setActualHistory] = useState([])
   const [scalingEvents, setScalingEvents] = useState([])
+  const [autoLoadEnabled, setAutoLoadEnabled] = useState(false)
+  const [autoLoadBusy, setAutoLoadBusy] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
@@ -18,9 +26,10 @@ function Dashboard() {
     async function load() {
       if (!active) return
 
-      const [predictionResult, eventsResult] = await Promise.allSettled([
+      const [predictionResult, eventsResult, autoLoadResult] = await Promise.allSettled([
         getPredictions(),
         getScalingEvents({ namespace: 'default', limit: 5 }),
+        getAutoLoadStatus('default'),
       ])
 
       if (!active) return
@@ -44,6 +53,10 @@ function Dashboard() {
         setScalingEvents(Array.isArray(eventsResult.value) ? eventsResult.value : [])
       }
 
+      if (autoLoadResult.status === 'fulfilled') {
+        setAutoLoadEnabled(Boolean(autoLoadResult.value?.enabled))
+      }
+
       if (active) {
         setLoading(false)
       }
@@ -57,6 +70,20 @@ function Dashboard() {
       clearInterval(timer)
     }
   }, [])
+
+  async function handleAutoLoadToggle() {
+    setAutoLoadBusy(true)
+    try {
+      const result = autoLoadEnabled
+        ? await stopAutoLoad('default')
+        : await startAutoLoad('default')
+      setAutoLoadEnabled(Boolean(result?.enabled))
+    } catch (err) {
+      setError(err.message || 'Failed to toggle auto-load')
+    } finally {
+      setAutoLoadBusy(false)
+    }
+  }
 
   const fallbackEnabled = Boolean(data?.fallback)
   const fallbackText = loading && !data ? 'CONNECTING...' : (fallbackEnabled ? 'Using Safe Mode' : 'Normal')
@@ -100,6 +127,22 @@ function Dashboard() {
 
       <section style={{ marginBottom: '1rem' }}>
         <h3>System State</h3>
+        <div style={{ marginBottom: '0.75rem' }}>
+          <button
+            type="button"
+            onClick={handleAutoLoadToggle}
+            disabled={autoLoadBusy}
+          >
+            {autoLoadBusy
+              ? 'Updating...'
+              : autoLoadEnabled
+                ? 'Stop Auto-Load'
+                : 'Start Auto-Load'}
+          </button>
+          <small style={{ marginLeft: '0.6rem' }}>
+            Auto-load: {autoLoadEnabled ? 'ON' : 'OFF'}
+          </small>
+        </div>
         <div className="grid">
           <section className="card metric-card">
             <h3>Fallback Status</h3>

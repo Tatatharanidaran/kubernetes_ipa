@@ -19,6 +19,9 @@ PREDICTION_SUCCESS_THRESHOLD_PCT = float(
 PROM_QUERY_RETRIES = int(os.environ.get("PROM_QUERY_RETRIES", "3"))
 PROM_QUERY_BACKOFF_SECONDS = float(os.environ.get("PROM_QUERY_BACKOFF_SECONDS", "0.5"))
 FALLBACK_FAILURE_THRESHOLD = int(os.environ.get("FALLBACK_FAILURE_THRESHOLD", "3"))
+PREDICTION_MAX_MULTIPLIER = float(os.environ.get("PREDICTION_MAX_MULTIPLIER", "1.6"))
+PREDICTION_ABSOLUTE_HEADROOM = float(os.environ.get("PREDICTION_ABSOLUTE_HEADROOM", "20"))
+PREDICTION_SMOOTHING_ALPHA = float(os.environ.get("PREDICTION_SMOOTHING_ALPHA", "0.35"))
 DEFAULT_METRIC_LABEL = os.environ.get(
     "DEFAULT_METRIC_LABEL",
     'sum(rate(http_requests_total{route="/"}[1m]))',
@@ -77,9 +80,63 @@ PREDICTION_ACCURACY_SUCCESS = Gauge(
 PENDING_PREDICTIONS = []
 CONSECUTIVE_FAILURES = {}
 LAST_GOOD_PREDICTIONS = {}
+LAST_PUBLISHED_PREDICTIONS = {}
+
+
+def _clamp_non_negative(value):
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _sanitize_prediction_bounds(prediction, low, high):
+    prediction = _clamp_non_negative(prediction)
+    low = _clamp_non_negative(low)
+    high = _clamp_non_negative(high)
+
+    if low > prediction:
+        low = prediction
+    if high < prediction:
+        high = prediction
+
+    return prediction, low, high
+
+
+def _stabilize_prediction(metric, prediction, low, high, latest_actual):
+    raw_prediction = _clamp_non_negative(prediction)
+    stabilized = raw_prediction
+    low = _clamp_non_negative(low)
+    high = _clamp_non_negative(high)
+
+    # Prevent extreme overshoot versus current observed load.
+    if latest_actual is not None and np.isfinite(latest_actual):
+        latest = _clamp_non_negative(latest_actual)
+        cap = max(latest * PREDICTION_MAX_MULTIPLIER, latest + PREDICTION_ABSOLUTE_HEADROOM)
+        stabilized = min(stabilized, cap)
+
+    # Smooth point-to-point jumps with EMA to reduce sawtooth spikes.
+    prev = LAST_PUBLISHED_PREDICTIONS.get(metric)
+    if prev is not None and np.isfinite(prev):
+        alpha = min(max(PREDICTION_SMOOTHING_ALPHA, 0.0), 1.0)
+        stabilized = alpha * stabilized + (1.0 - alpha) * float(prev)
+
+    # Keep interval magnitude aligned with stabilized center.
+    if raw_prediction > 0:
+        ratio = stabilized / raw_prediction
+        low *= ratio
+        high *= ratio
+    else:
+        low = min(low, stabilized)
+        high = max(high, stabilized)
+
+    stabilized, low, high = _sanitize_prediction_bounds(stabilized, low, high)
+    LAST_PUBLISHED_PREDICTIONS[metric] = stabilized
+    return stabilized, low, high
 
 
 def _record_metrics(metric, prediction, low, high, fallback):
+    prediction, low, high = _sanitize_prediction_bounds(prediction, low, high)
     PREDICTION.labels(metric=metric).set(prediction)
     PREDICTION_LOW.labels(metric=metric).set(low)
     PREDICTION_HIGH.labels(metric=metric).set(high)
@@ -89,6 +146,7 @@ def _record_metrics(metric, prediction, low, high, fallback):
 
 
 def _mark_success(metric, prediction, low, high, model):
+    prediction, low, high = _sanitize_prediction_bounds(prediction, low, high)
     CONSECUTIVE_FAILURES[metric] = 0
     LAST_GOOD_PREDICTIONS[metric] = {
         "prediction": float(prediction),
@@ -282,9 +340,10 @@ def _graceful_failure(metric, horizon, reason):
 
 
 def _baseline_prediction(metric, horizon, value, reason):
-    yhat = max(0.0, float(value))
-    low = max(0.0, yhat * 0.9)
-    high = yhat * 1.1
+    yhat = _clamp_non_negative(value)
+    low = _clamp_non_negative(yhat * 0.9)
+    high = _clamp_non_negative(yhat * 1.1)
+    yhat, low, high = _stabilize_prediction(metric, yhat, low, high, yhat)
     app.logger.info(
         "Baseline prediction used for metric='%s' horizon=%ss reason=%s value=%.4f",
         metric,
@@ -381,12 +440,14 @@ def predict():
 
         pred = forecast.iloc[-1]
 
-        yhat = float(pred["yhat"])
+        yhat = _clamp_non_negative(pred["yhat"])
         if not np.isfinite(yhat):
             return _graceful_failure(metric, horizon, "invalid_prediction")
 
-        low = float(pred["yhat_lower"])
-        high = float(pred["yhat_upper"])
+        low = _clamp_non_negative(pred["yhat_lower"])
+        high = _clamp_non_negative(pred["yhat_upper"])
+        latest_actual = float(df["y"].iloc[-1]) if not df.empty else None
+        yhat, low, high = _stabilize_prediction(metric, yhat, low, high, latest_actual)
         _record_metrics(metric, yhat, low, high, fallback=False)
         _mark_success(metric, yhat, low, high, "prophet")
         _enqueue_prediction(metric, yhat, horizon)

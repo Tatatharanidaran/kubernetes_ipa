@@ -97,13 +97,84 @@ ensure_dns_test_pod() {
   kubectl wait -n "$NAMESPACE" --for=condition=Ready pod/dns-test --timeout=60s >/dev/null 2>&1 || true
 }
 
+dns_lookup_registry() {
+  kubectl exec -n "$NAMESPACE" dns-test -- nslookup registry.ollama.ai >/dev/null 2>&1
+}
+
+verify_cluster_dns() {
+  attempts=3
+  attempt=1
+
+  while [ "$attempt" -le "$attempts" ]; do
+    if dns_lookup_registry; then
+      log_info "DNS test succeeded for registry.ollama.ai"
+      return 0
+    fi
+    log_warn "DNS lookup failed (attempt $attempt/$attempts). Retrying in 5s..."
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+
+  log_warn "DNS lookup failed, restarting CoreDNS and retrying..."
+  kubectl rollout restart deployment coredns -n kube-system >/dev/null 2>&1 || true
+  kubectl rollout status deployment coredns -n kube-system --timeout=120s >/dev/null 2>&1 || log_warn "CoreDNS rollout status check timed out."
+  sleep 5
+
+  attempt=1
+  while [ "$attempt" -le "$attempts" ]; do
+    if dns_lookup_registry; then
+      log_info "DNS recovered after CoreDNS restart."
+      return 0
+    fi
+    log_warn "DNS retry failed after CoreDNS restart (attempt $attempt/$attempts). Retrying in 5s..."
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+
+  log_warn "DNS retry failed after all attempts; continuing platform startup."
+  return 1
+}
+
+wait_for_ollama() {
+  namespace="$1"
+  attempts=3
+  timeout="120s"
+  attempt=1
+
+  while [ "$attempt" -le "$attempts" ]; do
+    log_info "Waiting for Ollama to be ready (attempt $attempt/$attempts)"
+    if kubectl wait -n "$namespace" --for=condition=Available deployment/ollama --timeout="$timeout"; then
+      log_info "Ollama ready"
+      return 0
+    fi
+
+    if [ "$attempt" -lt "$attempts" ]; then
+      log_warn "Ollama not ready yet. Retrying..."
+      if [ "$attempt" -eq 1 ]; then
+        log_warn "Restarting Ollama deployment once before retry."
+        kubectl rollout restart -n "$namespace" deployment/ollama >/dev/null 2>&1 || true
+      fi
+      sleep 10
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  log_warn "Ollama not ready after $attempts attempts, continuing bootstrap"
+  return 1
+}
+
 build_image() {
   dir="$1"
   tag="$2"
   log_info "Building image $tag"
   (
     cd "$ROOT_DIR/$dir"
-    docker build -t "$tag" .
+    if docker buildx version >/dev/null 2>&1; then
+      docker buildx build --load -t "$tag" .
+    else
+      DOCKER_BUILDKIT=0 docker build -t "$tag" .
+    fi
   )
 }
 
@@ -127,7 +198,26 @@ start_resilient_port_forward() {
   (
     while true; do
       echo "[INFO] Starting resilient port-forward for $name..."
-      kubectl -n "$namespace" port-forward "$resource" "$ports" 2>&1 | sed -u "s/^/[${name}] /"
+      fatal_error=0
+
+      # Read kubectl output line-by-line so we can trigger an immediate restart on
+      # stale-container and timeout stream errors.
+      while IFS= read -r line; do
+        echo "[${name}] $line"
+        case "$line" in
+          *"No such container"*|*"error forwarding port"*|*"Timeout occurred"*)
+            fatal_error=1
+            break
+            ;;
+        esac
+      done < <(kubectl -n "$namespace" port-forward "$resource" "$ports" 2>&1)
+
+      if [ "$fatal_error" -eq 1 ]; then
+        echo "[WARN] Port-forward for $name hit a forwarding stream error. Restarting in 1s..."
+        sleep 1
+        continue
+      fi
+
       echo "[WARN] Port-forward for $name disconnected. Reconnecting in 3s..."
       sleep 3
     done
@@ -173,18 +263,7 @@ ensure_namespace "$NAMESPACE"
 cleanup_stale_pods
 ensure_dns_test_pod
 
-if kubectl exec -n "$NAMESPACE" dns-test -- nslookup registry.ollama.ai >/dev/null 2>&1; then
-  log_info "DNS test succeeded for registry.ollama.ai"
-else
-  log_warn "DNS lookup failed, restarting CoreDNS and retrying once..."
-  kubectl rollout restart deployment coredns -n kube-system >/dev/null 2>&1 || true
-  sleep 20
-  if ! kubectl exec -n "$NAMESPACE" dns-test -- nslookup registry.ollama.ai >/dev/null 2>&1; then
-    log_warn "DNS retry failed; continuing platform startup."
-  else
-    log_info "DNS retry succeeded for registry.ollama.ai"
-  fi
-fi
+verify_cluster_dns || true
 
 log_info "Building local images"
 build_image "js-app" "js-app:latest" &
@@ -228,12 +307,8 @@ kubectl apply -n "$NAMESPACE" -f "$ROOT_DIR/demo-ipa.yaml"
 
 OLLAMA_READY=0
 if kubectl get deployment ollama -n "$NAMESPACE" >/dev/null 2>&1; then
-  log_info "Waiting for Ollama to be ready"
-  if kubectl wait -n "$NAMESPACE" --for=condition=Available deployment/ollama --timeout=120s; then
-    log_info "Ollama ready"
+  if wait_for_ollama "$NAMESPACE"; then
     OLLAMA_READY=1
-  else
-    log_warn "Ollama not ready, continuing bootstrap"
   fi
 else
   log_warn "Ollama deployment not found, continuing bootstrap"
@@ -259,6 +334,12 @@ kubectl wait -n "$NAMESPACE" --for=condition=Available deployment/ipa-controller
 kubectl wait -n "$NAMESPACE" --for=condition=Available deployment/ipa-backend --timeout=120s
 
 if kubectl get namespace monitoring >/dev/null 2>&1 && kubectl get deployment grafana -n monitoring >/dev/null 2>&1; then
+  kubectl create configmap ipa-prediction-dashboard \
+    -n monitoring \
+    --from-file=ipa-prediction-dashboard.json="$ROOT_DIR/predictor-service/grafana/ipa-prediction-dashboard.json" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+  kubectl label configmap ipa-prediction-dashboard -n monitoring grafana_dashboard=1 --overwrite >/dev/null 2>&1 || true
+
   kubectl set env deployment/grafana -n monitoring \
     GF_SECURITY_ALLOW_EMBEDDING=true \
     GF_SECURITY_COOKIE_SAMESITE=lax \
@@ -276,6 +357,7 @@ PREDICTOR_LOCAL_PORT="18000"
 BACKEND_LOCAL_PORT="8000"
 GRAFANA_LOCAL_PORT="3000"
 PROMETHEUS_LOCAL_PORT="19090"
+GRAFANA_DASHBOARD_PATH="${GRAFANA_DASHBOARD_PATH:-/d/ipa-prediction/ipa-prediction}"
 
 if kubectl get namespace monitoring >/dev/null 2>&1; then
   start_resilient_port_forward "monitoring" "svc/prometheus-k8s" "$PROMETHEUS_LOCAL_PORT:9090" "prometheus"
@@ -284,13 +366,13 @@ fi
 
 start_resilient_port_forward "$NAMESPACE" "svc/llm-decision-service" "$LLM_LOCAL_PORT:5000" "llm-decision-service"
 start_resilient_port_forward "$NAMESPACE" "svc/predictor" "$PREDICTOR_LOCAL_PORT:8000" "predictor-service"
-start_resilient_port_forward "$NAMESPACE" "svc/ipa-backend" "$BACKEND_LOCAL_PORT:8000" "ipa-backend"
+start_resilient_port_forward "$NAMESPACE" "deployment/ipa-backend" "$BACKEND_LOCAL_PORT:8000" "ipa-backend"
 
 cat > "$ROOT_DIR/frontend/.env.local" <<EOF
 VITE_API_BASE_URL=http://localhost:$BACKEND_LOCAL_PORT
-VITE_GRAFANA_URL=http://localhost:$GRAFANA_LOCAL_PORT
+VITE_GRAFANA_URL=http://localhost:$GRAFANA_LOCAL_PORT$GRAFANA_DASHBOARD_PATH
 EOF
-log_info "Wrote frontend/.env.local with API=http://localhost:$BACKEND_LOCAL_PORT and Grafana=http://localhost:$GRAFANA_LOCAL_PORT"
+log_info "Wrote frontend/.env.local with API=http://localhost:$BACKEND_LOCAL_PORT and Grafana=http://localhost:$GRAFANA_LOCAL_PORT$GRAFANA_DASHBOARD_PATH"
 
 printf "\n===== IPA PLATFORM LIVE =====\n\n"
 

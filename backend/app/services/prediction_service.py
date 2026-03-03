@@ -20,16 +20,18 @@ SAFE_DEFAULTS = {
 class PredictionService:
     def __init__(self, prometheus_client: PrometheusClient):
         self.prometheus_client = prometheus_client
+        self._last_good_metrics: dict[str, float | int] = SAFE_DEFAULTS.copy()
 
     async def get_prediction_metrics(self) -> dict[str, float | int]:
         queries = {
-            "prediction": "ipa_prediction",
-            "actual_load": "(sum(rate(http_requests_total{route=\"/\"}[1m])) or js_app_requests_per_second)",
-            "low": "ipa_prediction_low",
-            "high": "ipa_prediction_high",
-            "fallback": "ipa_prediction_fallback",
+            # Aggregate across metric-label series so we don't pick an arbitrary stale series.
+            "prediction": "max(ipa_prediction)",
+            "actual_load": "(sum(rate(http_requests_total{route=\"/\"}[1m])) or max(js_app_requests_per_second))",
+            "low": "max(ipa_prediction_low)",
+            "high": "max(ipa_prediction_high)",
+            "fallback": "max(ipa_prediction_fallback)",
             # Support both metric names (legacy/new) exposed by predictor versions.
-            "last_success": "(ipa_prediction_last_success_timestamp or ipa_prediction_last_accuracy_success_timestamp)",
+            "last_success": "max((ipa_prediction_last_success_timestamp or ipa_prediction_last_accuracy_success_timestamp))",
         }
 
         results = await asyncio.gather(
@@ -45,12 +47,17 @@ class PredictionService:
             if value is None:
                 unavailable_count += 1
                 missing_keys.append(key)
+                if key in self._last_good_metrics:
+                    metrics[key] = self._last_good_metrics[key]
                 continue
             metrics[key] = int(value) if key == "fallback" else float(value)
 
         for key in ("prediction", "actual_load", "low", "high", "last_success"):
             if key in metrics:
                 metrics[key] = round(float(metrics[key]), 2)
+
+        for key in ("prediction", "low", "high"):
+            metrics[key] = max(0.0, float(metrics[key]))
 
         if unavailable_count > 0:
             logger.warning(
@@ -65,6 +72,13 @@ class PredictionService:
             )
             if core_metric_missing:
                 logger.warning("Prometheus core metrics missing – predictor running in fallback mode.")
+        else:
+            self._last_good_metrics = metrics.copy()
+
+        if unavailable_count > 0:
+            for key in queries.keys():
+                if key not in missing_keys:
+                    self._last_good_metrics[key] = metrics[key]
         return metrics
 
     async def get_predictions(self) -> dict[str, Any]:

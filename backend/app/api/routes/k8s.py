@@ -36,3 +36,39 @@ async def get_scaling_events(
             exc,
         )
         raise HTTPException(status_code=502, detail=f"Failed to fetch scaling events: {exc}") from exc
+
+
+@router.get("/auto-load/status")
+async def get_auto_load_status(
+    namespace: str = Query(default="default"),
+    service: K8sService = Depends(get_k8s_service),
+):
+    try:
+        return await service.get_auto_load_status(namespace=namespace)
+    except Exception as exc:
+        logger.exception("Failed to fetch auto-load status for namespace='%s': %s", namespace, exc)
+        raise HTTPException(status_code=502, detail=f"Failed to fetch auto-load status: {exc}") from exc
+
+
+@router.post("/auto-load/start")
+async def start_auto_load(
+    namespace: str = Query(default="default"),
+    service: K8sService = Depends(get_k8s_service),
+):
+    try:
+        return await service.set_auto_load(enabled=True, namespace=namespace)
+    except Exception as exc:
+        logger.exception("Failed to start auto-load for namespace='%s': %s", namespace, exc)
+        raise HTTPException(status_code=502, detail=f"Failed to start auto-load: {exc}") from exc
+
+
+@router.post("/auto-load/stop")
+async def stop_auto_load(
+    namespace: str = Query(default="default"),
+    service: K8sService = Depends(get_k8s_service),
+):
+    try:
+        return await service.set_auto_load(enabled=False, namespace=namespace)
+    except Exception as exc:
+        logger.exception("Failed to stop auto-load for namespace='%s': %s", namespace, exc)
+        raise HTTPException(status_code=502, detail=f"Failed to stop auto-load: {exc}") from exc

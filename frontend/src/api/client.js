@@ -8,13 +8,13 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function request(path) {
+async function request(path, options = {}) {
   let lastError = null
 
   for (const base of apiBases) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        const response = await fetch(`${base}${path}`)
+        const response = await fetch(`${base}${path}`, options)
         if (!response.ok) {
           const message = await response.text()
           throw new Error(message || `Request failed with status ${response.status}`)
@@ -46,6 +46,21 @@ export function getScalingEvents({ namespace = 'default', limit = 5 } = {}) {
   if (namespace) params.set('namespace', namespace)
   if (limit) params.set('limit', String(limit))
   return request(`/api/k8s/scaling-events?${params.toString()}`)
+}
+
+export function getAutoLoadStatus(namespace = 'default') {
+  const query = namespace ? `?namespace=${encodeURIComponent(namespace)}` : ''
+  return request(`/api/k8s/auto-load/status${query}`)
+}
+
+export function startAutoLoad(namespace = 'default') {
+  const query = namespace ? `?namespace=${encodeURIComponent(namespace)}` : ''
+  return request(`/api/k8s/auto-load/start${query}`, { method: 'POST' })
+}
+
+export function stopAutoLoad(namespace = 'default') {
+  const query = namespace ? `?namespace=${encodeURIComponent(namespace)}` : ''
+  return request(`/api/k8s/auto-load/stop${query}`, { method: 'POST' })
 }
 
 export function getGrafanaHealth() {
